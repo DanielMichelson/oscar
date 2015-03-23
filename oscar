@@ -247,14 +247,16 @@ if __name__ == "__main__":
 
     parser.add_option("-p", "--pulsewidth", dest="pw", type="float", default=0.5, help="Pulse width. Defaults to 0.5 milliseconds.")
 
-    parser.add_option("-O", "--odim", dest="odim", action="store_true", default=False, help="Writes an ODIM_H5 scan containing all derived quality indicators. Defaults to False and will instead write a simpler HDF5 file with rudimentary metadata and unscaled capabilities.")
+    parser.add_option("-O", "--odim", dest="odim", action="store_true", default=False, help="Writes an ODIM_H5 scan containing all derived quality indicators. Defaults to False and will instead write a text file containing rudimentary metadata and a swarm of capabilities, each with its position.")
 
-    parser.add_option("-o", "--output", dest="ofile", default="out.txt", help="Output file name. If not given, defaults to 'out.txt'.")
+    parser.add_option("-o", "--output", dest="ofile", default="out.txt", help="Output file name. If not given, defaults to 'out.txt', unless the -O option is given which will instead give 'out.h5'.")
 
     (options, args) = parser.parse_args()
 
     if not options.lon or not options.lat or not options.alt or not options.elangle:
         parser.print_help()
         sys.exit(1)
+
+    if options.odim and options.ofile is 'out.txt': options.ofile = 'out.h5'
 
     main(options)
