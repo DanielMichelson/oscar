@@ -22,7 +22,7 @@ along with RAVE.  If not, see <http://www.gnu.org/licenses/>.
 
 ## @file
 ## @author Daniel Michelson, SMHI
-## @date 2015-03-21
+## @date 2015-03-23
 
 import sys, os
 from Proj import dr, rd
@@ -32,7 +32,6 @@ import _polarscanparam
 import _ravefield
 from numpy import *
 import odc_polarQC
-import _pyhl
 
 odc_polarQC.algorithm_ids = ("beamb", "radvol-broad")
 max_height = 10000.0
@@ -68,7 +67,7 @@ def init(options):
     scan = _polarscan.new()
     dbzh = _polarscanparam.new() 
 
-    scan.longitude = options.lon * dr
+    scan.longitude = options.lon * dr  # All angles need to be in radians
     scan.latitude = options.lat * dr
     scan.height = options.alt
     scan.elangle = options.elangle * dr
@@ -95,7 +94,6 @@ def makeHeightQI(scan):
 
     h1d = scan.getHeightField()
     h1d_data = h1d.getData()
-    #h1d_data[0][249] = 100000.0   ## REMOVE THIS!!!
     height_field = []
     for i in range(scan.nrays):
         height_field.append(h1d_data[0]-scan.height)
@@ -103,7 +101,7 @@ def makeHeightQI(scan):
     
     height_field = where(less(height_field, 0.0), 0.0, height_field)
     mask = greater(height_field, max_height)
-    dbzh = scan.getParameter("DBZH")  # Beam heights above max_height give useless data.
+    dbzh = scan.getParameter("DBZH")
     dbzh_data = dbzh.getData()
     dbzh_data = where(equal(mask, 1), dbzh.nodata, dbzh_data)
     dbzh.setData(dbzh_data.astype(uint8))
@@ -194,7 +192,6 @@ def writeOscar(scan, options):
 
             fd.write("%3.6f\t%3.6f\t%4.1f\t%1.1f\t%2.1f\t%i\n" % (lond, latd, height, qi_aloft,
                                                                   qi_surf, unusable))
-
 
     fd.close()
 
