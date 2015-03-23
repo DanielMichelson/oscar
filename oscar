@@ -1,0 +1,263 @@
+#!/usr/bin/env python
+'''
+Copyright (C) 2015- Swedish Meteorological and Hydrological Institute (SMHI)
+
+This file is part of RAVE.
+
+RAVE is free software: you can redistribute it and/or modify
+it under the terms of the GNU Lesser General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+RAVE is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Lesser General Public License for more details.
+
+You should have received a copy of the GNU Lesser General Public License
+along with RAVE.  If not, see <http://www.gnu.org/licenses/>.
+'''
+
+## Determines OSCAR weather radar capabilities 
+
+## @file
+## @author Daniel Michelson, SMHI
+## @date 2015-03-21
+
+import sys, os
+from Proj import dr, rd
+import _raveio
+import _polarscan
+import _polarscanparam
+import _ravefield
+from numpy import *
+import odc_polarQC
+import _pyhl
+
+odc_polarQC.algorithm_ids = ("beamb", "radvol-broad")
+max_height = 10000.0
+qi_gain = 1.0 / 255
+qi_offset = 0.0
+minerr = 1.0
+maxerr = 5.0   # Maximum error/uncertainty aloft
+maxscale = 3.0 # Maximum scaling factor to get error/uncertainty at the surface
+surferr = 15.0 # Maximum error/uncertainty as a surface measurement
+
+
+## Arguments used for testing and debugging. Position is Mt. Lema, Switzerland
+#  Metadata is taken from the WMO Weather Radar Database.
+class debug_object(object):
+    def __init__(self):
+        self.lon = 8.833889
+        self.lat = 46.041944
+        self.alt = 1625.0
+        self.elangle = -0.2
+        self.rays = 360
+        self.bins = 250
+        self.bw = 1.0
+        self.blen = 1000.0
+        self.pw = 0.5
+        self.ofile = "out.txt"
+
+
+## Initializes the scan to be used for the determination of capabilities.
+#  This scan contains data void of any echoes.
+# @param options object passed from the OptionParser class containing command-line arguments and values
+# @returns initialized PolarScanCore object
+def init(options):
+    scan = _polarscan.new()
+    dbzh = _polarscanparam.new() 
+
+    scan.longitude = options.lon * dr
+    scan.latitude = options.lat * dr
+    scan.height = options.alt
+    scan.elangle = options.elangle * dr
+    scan.beamwidth = options.bw * dr
+    scan.rscale = options.blen
+    scan.addAttribute("how/pulsewidth", options.pw)
+
+    dbzh.setData(zeros((options.rays, options.bins), uint8))
+    dbzh.nodata = 255.0
+    dbzh.undetect = 0.0
+    dbzh.gain = 0.5
+    dbzh.offset = -32.0
+    dbzh.quantity = "DBZH"
+
+    scan.addParameter(dbzh)
+    return scan
+
+
+## Generates the quality indicator based on beam main axis height.
+# @param scan PolarScanCore object
+# @returns scan PolarScanCore object including height-based quality indicator
+def makeHeightQI(scan):
+    name = "se.smhi.detector.beamheight"
+
+    h1d = scan.getHeightField()
+    h1d_data = h1d.getData()
+    #h1d_data[0][249] = 100000.0   ## REMOVE THIS!!!
+    height_field = []
+    for i in range(scan.nrays):
+        height_field.append(h1d_data[0]-scan.height)
+    height_field = array(height_field)
+    
+    height_field = where(less(height_field, 0.0), 0.0, height_field)
+    mask = greater(height_field, max_height)
+    dbzh = scan.getParameter("DBZH")  # Beam heights above max_height give useless data.
+    dbzh_data = dbzh.getData()
+    dbzh_data = where(equal(mask, 1), dbzh.nodata, dbzh_data)
+    dbzh.setData(dbzh_data.astype(uint8))
+    
+    height_field = where(equal(mask, 1), max_height, height_field)  # Threshold this field for convenience
+    height_field = ((1.0-height_field/max_height)/qi_gain).astype(uint8) # Scale to 8-bit QIND
+
+    qfield = _ravefield.new()
+    qfield.setData(height_field)
+    qfield.addAttribute('how/task', name)
+    qfield.addAttribute('what/gain', qi_gain)
+    qfield.addAttribute('what/offset', qi_offset)
+
+    scan.addQualityField(qfield)
+    return scan
+    
+
+## Determines minimum quality. Also scales blockage such that areas blocked >70% receive quality 0.
+# @param scan PolarScanCore object
+# @returns scan PolarScanCore object
+def makeMinQI(scan):
+    name = "se.smhi.detector.minquality"
+
+    dbzh = scan.getParameter("DBZH")
+    dbzh_data = dbzh.getData()
+
+    blockage = scan.getQualityFieldByHowTask('se.smhi.detector.beamblockage').getData()
+    mask = less(blockage, 0.3*qi_gain)
+    #blockage = where(equal(mask, 1), 0, blockage)
+    dbzh_data = where(equal(mask, 1), dbzh.nodata, dbzh_data)
+    dbzh.setData(dbzh_data.astype(uint8))
+
+    broad = scan.getQualityFieldByHowTask('pl.imgw.radvolqc.broad').getData()
+
+    height = scan.getQualityFieldByHowTask('se.smhi.detector.beamheight').getData()
+
+    minqi = minimum(blockage, broad)
+    minqi = minimum(minqi, height)
+
+    qfield = _ravefield.new()
+    qfield.setData(minqi)
+    qfield.addAttribute('how/task', name)
+    qfield.addAttribute('what/gain', qi_gain)
+    qfield.addAttribute('what/offset', qi_offset)
+
+    scan.addQualityField(qfield)
+    return scan
+
+
+## Convenience function. Scales values from MIN-MAX to a-b
+# @ returns float the re-scaled value
+def scale(MIN, MAX, a, b, val):
+    return ((b-a)*(val-MIN)/(MAX-MIN))+a
+
+
+## Writes capabilities to text file
+# @param scan PolarScanCore object
+# @param options object containing command-line options
+def writeOscar(scan, options):
+    heights = scan.getHeightField().getData()[0]
+    qi = scan.getQualityFieldByHowTask('se.smhi.detector.minquality')
+    qi_data = qi.getData()
+    qi_data = 1.0 - qi_data * qi_gain  # Scaled between 0-1, but inverted
+
+    dbzh_data = scan.getParameter("DBZH").getData()
+
+    fd = open(options.ofile, 'w')
+    fd.write("Lon=%3.6f Lat=%2.6f Alt=%4.1f Rays=%i Bins=%i Scan=%2.1f\n" % (scan.longitude*rd, scan.latitude*rd,
+                                                                             scan.height, scan.nrays, scan.nbins,
+                                                                             scan.elangle*rd))
+    fd.write("Beamwidth=%2.2f Binlength=%3.1f Pulsewidth=%2.2f\n" % (scan.beamwidth*rd, scan.rscale,
+                                                                     scan.getAttribute("how/pulsewidth")))
+    fd.write("Lon\t\tLat\t\tAlt\tAloft\tSurf\tUnusable\n")
+
+    for ray in range(scan.nrays):
+        for bin in range(1, scan.nbins):  # First bin is always the same, so skip
+            height = heights[bin]
+            unusable = dbzh_data[ray][bin]
+            if unusable == 255: unusable = 1
+            qi = qi_data[ray][bin]
+            qi_aloft = scale(0.0, 1.0, minerr, maxerr, qi)
+            qi_scale = scale(minerr, maxerr, minerr, maxscale, qi_aloft)
+            qi_surf = qi_aloft * qi_scale
+            #qi_surf = scale(0.0, 1.0, minerr, surferr, qi)  # Alternative scaling
+
+            lonr, latr = scan.getLonLatFromIndex(bin, ray)  # Note indexing!
+            lond, latd = lonr*rd, latr*rd
+
+            fd.write("%3.6f\t%3.6f\t%4.1f\t%1.1f\t%2.1f\t%i\n" % (lond, latd, height, qi_aloft,
+                                                                  qi_surf, unusable))
+
+
+    fd.close()
+
+
+## Main function
+# @param object options object containing command-line options
+def main(options):
+    scan = init(options)
+
+    # Beam blockage and broadening effects. These are run through the standard BALTRAD quality plugins.
+    scan = odc_polarQC.QC(scan)
+    
+    # Heights are determined and manipulated manually, as there is no specific quality plugin for this.
+    scan = makeHeightQI(scan)
+
+    # Minimum quality
+    scan = makeMinQI(scan)
+    
+    if options.odim:
+        # Write out scan in ODIM_H5, containing scaled [0-255] quality indicators not scaled to OSCAR capabilities. 
+        rio = _raveio.new()
+        rio.object = scan
+        rio.save(options.ofile)
+
+    else:
+        # Write out result in ASCII with capabilities for OSCAR
+        writeOscar(scan, options)
+        
+
+if __name__ == "__main__":
+    from optparse import OptionParser
+
+    description = "OSCAR weather radar capabilities"
+
+    usage = "usage: %prog -l <longitude> -L <latitude> -a <altitude> -e <elevation angle> [-r <rays> -b <bins> -w <beam width> -R <bin length> -p <pulse width> -o <output_file>] [hs]"
+    parser = OptionParser(usage=usage, description=description)
+
+    parser.add_option("-l", "--longitude", dest="lon", type="float", help="Site's longitude (decimal degrees)")
+
+    parser.add_option("-L", "--latitude", dest="lat", type="float", help="Site's latitude (decimal degrees)")
+
+    parser.add_option("-a", "--altitude", dest="alt", type="float", help="Radar antenna's altitude (m a s l)")
+
+    parser.add_option("-e", "--elevation", dest="elangle", type="float", help=" Antenna's elevation angle (degrees relative to horizon)")
+
+    parser.add_option("-r", "--rays", dest="rays", type="int", default=360, help="Number of rays per scan. Defaults to 360.")
+
+    parser.add_option("-b", "--bins", dest="bins", type="int", default=250, help="Number of bins per ray. Defaults to 250.")
+
+    parser.add_option("-w", "--beamwidth", dest="bw", type="float", default=1.0, help="Half-power beamwidth (degrees). Defaults to 1.0")
+
+    parser.add_option("-R", "--binlen", dest="blen", type="float", default=1000.0, help="Distance between two successive range bins (meters). Defaults to 1000.0")
+
+    parser.add_option("-p", "--pulsewidth", dest="pw", type="float", default=0.5, help="Pulse width. Defaults to 0.5 milliseconds.")
+
+    parser.add_option("-O", "--odim", dest="odim", action="store_true", default=False, help="Writes an ODIM_H5 scan containing all derived quality indicators. Defaults to False and will instead write a simpler HDF5 file with rudimentary metadata and unscaled capabilities.")
+
+    parser.add_option("-o", "--output", dest="ofile", default="out.txt", help="Output file name. If not given, defaults to 'out.txt'.")
+
+    (options, args) = parser.parse_args()
+
+    if not options.lon or not options.lat or not options.alt or not options.elangle:
+        parser.print_help()
+        sys.exit(1)
+
+    main(options)
